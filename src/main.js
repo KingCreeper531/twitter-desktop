@@ -148,13 +148,24 @@ function createWindow() {
 
   // The site's own link redirects (e.g. l.facebook.com) lead outside, even though they're on its domain
   const stays = (url) => isInternal(url) && !site.isRedirect?.(url);
+  // "Continue with Google / Apple" sign-in opens in a small window inside the app (it reports back to the page)
+  const SIGN_IN = /^https:\/\/(accounts\.google\.com|appleid\.apple\.com)\//;
   win.webContents.setWindowOpenHandler(({ url }) => {
+    if (SIGN_IN.test(url)) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 500, height: 700, parent: win, autoHideMenuBar: true, backgroundColor: '#ffffff',
+          webPreferences: { partition: site.partition, contextIsolation: true, sandbox: true },
+        },
+      };
+    }
     if (stays(url)) win.loadURL(url);
     else openOutside(url);
     return { action: 'deny' };
   });
   win.webContents.on('will-navigate', (e, url) => {
-    if (stays(url)) return;
+    if (stays(url) || SIGN_IN.test(url)) return;
     e.preventDefault();
     openOutside(url);
   });

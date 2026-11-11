@@ -183,32 +183,114 @@
       }
     }
   }
+  // Every place X draws its logo: the menu, the loading screen and the big one on the sign-in page
+  const LOGO_SPOTS = 'header[role="banner"] h1 svg, svg[aria-label="X"], a[aria-label="X"] svg, div[aria-label="Loading…"] svg, div[aria-label="Loading"] svg';
   function classicLogo(on) {
-    for (const path of document.querySelectorAll('header[role="banner"] h1 svg path, div[aria-label="Loading…"] svg path, div[aria-label="Loading"] svg path, a[aria-label="X"] svg path')) {
-      const svg = path.closest('svg');
-      if (on && !path.dataset.ranchOrig) {
-        path.dataset.ranchOrig = path.getAttribute('d');
-        path.setAttribute('d', BIRD);
+    if (on) {
+      for (const svg of document.querySelectorAll(LOGO_SPOTS)) {
+        if (svg.dataset.ranchLogo) continue;
+        svg.dataset.ranchLogo = JSON.stringify({ html: svg.innerHTML, viewBox: svg.getAttribute('viewBox') });
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.innerHTML = `<path d="${BIRD}"></path>`;
         svg.style.color = '#1d9bf0';
         svg.style.fill = '#1d9bf0';
-      } else if (!on && path.dataset.ranchOrig) {
-        path.setAttribute('d', path.dataset.ranchOrig);
-        delete path.dataset.ranchOrig;
+      }
+    } else {
+      for (const svg of document.querySelectorAll('svg[data-ranch-logo]')) {
+        try {
+          const orig = JSON.parse(svg.dataset.ranchLogo);
+          svg.innerHTML = orig.html;
+          if (orig.viewBox) svg.setAttribute('viewBox', orig.viewBox);
+        } catch { /* ignore */ }
+        delete svg.dataset.ranchLogo;
         svg.style.removeProperty('color');
         svg.style.removeProperty('fill');
       }
     }
   }
+  // The signed-out start page, laid out like old Twitter: a blue panel with a big white
+  // bird on the left, the small bird, "Happening now" and "Join Twitter today." on the right.
+  const CLASSIC_LANDING_CSS = `
+    [data-ranch-classic-row] { flex-direction: row-reverse !important; }
+    [data-ranch-classic-panel] { background: #1da1f2 !important; align-items: center !important; justify-content: center !important; }
+    [data-ranch-classic-panel] svg { fill: #fff !important; color: #fff !important; }
+    [data-ranch-classic-panel] svg[data-ranch-logo] { width: min(380px, 60%) !important; height: auto !important; max-height: 70vh; }
+    #ranch-classic-small-bird { width: 48px; height: 48px; fill: #1d9bf0; display: block; margin: 0 0 40px; }
+    #ranch-classic-join { font: 800 31px/36px "Segoe UI", system-ui, sans-serif; margin: 0 0 32px; color: inherit; }
+    [data-ranch-classic-hide] { display: none !important; }
+  `;
+  let classicLandingCss = null;
+  function classicLanding(on) {
+    const big = [...document.querySelectorAll('svg[aria-label="X"], svg[data-ranch-logo]')]
+      .find((s) => s.getBoundingClientRect().height > 150 || (s.parentElement && s.parentElement.getBoundingClientRect().height > 300));
+    const panel = big && (() => {
+      // The half of the page that holds the big logo: the ancestor whose parent splits the page in two
+      let el = big;
+      while (el.parentElement && el.parentElement !== document.body) {
+        const p = el.parentElement;
+        if (p.childElementCount === 2 && getComputedStyle(p).flexDirection === 'row' && p.getBoundingClientRect().width > window.innerWidth * 0.8) return el;
+        el = p;
+      }
+      return null;
+    })();
+    if (!on || !panel) {
+      if (!on) {
+        for (const el of document.querySelectorAll('[data-ranch-classic-row], [data-ranch-classic-panel], [data-ranch-classic-hide]')) {
+          el.removeAttribute('data-ranch-classic-row'); el.removeAttribute('data-ranch-classic-panel'); el.removeAttribute('data-ranch-classic-hide');
+        }
+        document.getElementById('ranch-classic-small-bird')?.remove();
+        document.getElementById('ranch-classic-join')?.remove();
+        if (classicLandingCss) { webFrame.removeInsertedCSS(classicLandingCss); classicLandingCss = null; }
+      }
+      return;
+    }
+    if (!classicLandingCss) classicLandingCss = webFrame.insertCSS(CLASSIC_LANDING_CSS);
+    panel.setAttribute('data-ranch-classic-panel', '');
+    panel.parentElement.setAttribute('data-ranch-classic-row', '');
+    const h1 = [...document.querySelectorAll('h1')].find((h) => /^Happening now\.?$/.test((h.textContent || '').trim()));
+    if (h1) {
+      const leaf = [...h1.querySelectorAll('span')].find((s) => !s.children.length) || h1;
+      if (leaf.textContent.trim() !== 'Happening now') { if (leaf.dataset.ranchOrig === undefined) leaf.dataset.ranchOrig = leaf.textContent; leaf.textContent = 'Happening now'; }
+      if (!document.getElementById('ranch-classic-small-bird')) {
+        const NS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(NS, 'svg');
+        svg.id = 'ranch-classic-small-bird';
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('aria-hidden', 'true');
+        const p = document.createElementNS(NS, 'path');
+        p.setAttribute('d', BIRD);
+        svg.appendChild(p);
+        h1.parentElement.insertBefore(svg, h1);
+      }
+      if (!document.getElementById('ranch-classic-join')) {
+        const join = document.createElement('h2');
+        join.id = 'ranch-classic-join';
+        join.textContent = 'Join Twitter today.';
+        h1.insertAdjacentElement('afterend', join);
+      }
+    }
+    // Old Twitter didn't have the "Scan to get the app" box
+    for (const span of document.querySelectorAll('span')) {
+      if (!span.children.length && span.textContent.trim() === 'Scan to get the app') {
+        let box = span;
+        for (let i = 0; i < 4 && box.parentElement; i++) { box = box.parentElement; if (box.querySelector('canvas, svg, img') && box.getBoundingClientRect().width < 300) break; }
+        box.setAttribute('data-ranch-classic-hide', '');
+      }
+    }
+  }
+
   function classicPass() {
     if (!cfg.classicTwitter) return;
     classicLogo(true);
+    classicLanding(true);
     classicText();
     if (document.title.includes(' / X')) document.title = document.title.replace(/ \/ X$/, ' / Twitter');
   }
   function classicUndo() {
+    classicLanding(false);
     classicLogo(false);
     for (const el of document.querySelectorAll('[data-ranch-orig]')) {
-      if (el.tagName !== 'path') el.textContent = el.dataset.ranchOrig;
+      el.textContent = el.dataset.ranchOrig;
       delete el.dataset.ranchOrig;
     }
   }
