@@ -1,7 +1,8 @@
 // Classic Twitter: Twitter as it looked around 2018, drawn by the app on top of x.com.
-// Runs in the page itself (so requests carry your sign-in, like X's own site), and
-// loads data from the same web API X's site uses. Pages it doesn't draw (Messages,
-// Search, Settings, Lists…) are X's own. window.ranchTwitter is provided by preload.js.
+// X's own page keeps running, hidden, underneath: it loads the data (X only accepts its
+// own requests) and the classic pages show it; buttons press X's own buttons. Pages it
+// doesn't draw (Messages, Search, Settings, Lists…) are X's own, shown as usual.
+// window.ranchTwitter is provided by preload.js.
 (function () {
   'use strict';
   if (window.__ranchClassic) return;
@@ -20,8 +21,16 @@
     return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
   };
   const full = (n) => (Number(n) || 0).toLocaleString('en-US');
+  /** A date from X's many formats: milliseconds or seconds (as numbers or text) or date text. */
+  function toDate(x) {
+    if (x == null || x === '') return null;
+    if (typeof x === 'number' || /^\d+$/.test(String(x))) { let n = Number(x); if (n < 1e12) n *= 1000; return new Date(n); }
+    const d = new Date(x);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
   function ago(d) {
-    const t = new Date(d);
+    const t = toDate(d);
+    if (!t) return '';
     const s = (Date.now() - t) / 1000;
     if (s < 60) return Math.max(1, Math.floor(s)) + 's';
     if (s < 3600) return Math.floor(s / 60) + 'm';
@@ -54,89 +63,139 @@
   };
   const svg = (name, cls) => `<svg class="ic ${cls || ''}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICON[name]}"/></svg>`;
 
-  // ==================================================================== X's web API
-  // The same requests X's own site makes. The operation IDs and feature flags change
-  // with every X release, so they're read from X's own script bundle at runtime.
-  const api = { ops: {}, bearer: null, ready: null };
-  function parseBundle(text) {
-    const re = /queryId:\s*"([^"]+)",\s*operationName:\s*"([^"]+)",\s*operationType:\s*"([^"]+)",\s*metadata:\s*\{\s*featureSwitches:\s*\[([^\]]*)\],\s*fieldToggles:\s*\[([^\]]*)\]/g;
-    let m;
-    while ((m = re.exec(text))) {
-      const list = (s) => (s.match(/"([^"]+)"/g) || []).map((x) => x.slice(1, -1));
-      api.ops[m[2]] = { id: m[1], type: m[3], features: list(m[4]), toggles: list(m[5]) };
-    }
-    if (!api.bearer) { const b = text.match(/"(AAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%]{40,})"/); if (b) api.bearer = b[1]; }
-  }
-  function bundleUrls() {
-    const urls = new Set();
-    for (const s of document.querySelectorAll('script[src]')) if (/abs\.twimg\.com\/responsive-web\/client-web[^"]*\.js/.test(s.src)) urls.add(s.src);
-    for (const e of performance.getEntriesByType('resource')) if (/abs\.twimg\.com\/responsive-web\/client-web[^?]*\.js$/.test(e.name)) urls.add(e.name);
-    return [...urls].sort((a, b) => (/\/main\./.test(b) ? 1 : 0) - (/\/main\./.test(a) ? 1 : 0));
-  }
-  function ensureApi() {
-    if (api.ready) return api.ready;
-    api.ready = (async () => {
-      for (let attempt = 0; attempt < 20 && !bundleUrls().length; attempt++) await new Promise((r) => setTimeout(r, 300));
-      for (const url of bundleUrls()) {
-        try { parseBundle(await bridge.getText(url)); } catch { /* next */ }
-        if (api.bearer && api.ops.HomeLatestTimeline && api.ops.UserByScreenName && api.ops.TweetDetail) break;
+  // ==================================================================== mirror: what X's own page loads
+  // X only accepts requests made by its own scripts, so the classic pages don't ask X for
+  // anything themselves. X's normal page keeps running (hidden) underneath; this listens to
+  // the answers it gets and the classic pages show those.
+  const safeJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
+  const feed = { listeners: new Set(), recent: [] };
+  const WANT = new Set(['HomeLatestTimeline', 'HomeTimeline', 'UserByScreenName', 'UserTweets', 'UserTweetsAndReplies', 'UserMedia',
+    'UserOriginalsTimeline', 'UserRepliesTimeline', 'UserVideoTimeline', 'UserMediaTimeline',
+    'TweetDetail', 'NotificationsTimeline', 'CreateTweet', 'rest:notifications/all', 'rest:notifications/mentions']);
+  function describe(url, body) {
+    try {
+      const u = new URL(url, location.href);
+      let m = u.pathname.match(/\/i\/api\/graphql\/[^/]+\/(\w+)/);
+      if (m) {
+        let vars = safeJson(u.searchParams.get('variables'));
+        if (!vars && typeof body === 'string') { const b = safeJson(body); vars = b && b.variables; }
+        return { op: m[1], vars: vars || {} };
       }
-      if (!api.bearer) throw new Error('Couldn\'t read X\'s site setup');
-    })();
-    api.ready.catch(() => { api.ready = null; });
-    return api.ready;
+      m = u.pathname.match(/\/i\/api\/2\/notifications\/(all|mentions)\.json/);
+      if (m) return { op: `rest:notifications/${m[1]}`, vars: { cursor: u.searchParams.get('cursor') } };
+    } catch { /* not ours */ }
+    return null;
   }
-  function featureValues(names) {
-    const fs = (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.featureSwitch) || {};
-    const user = (fs.user && fs.user.config) || {};
-    const def = fs.defaultConfig || {};
-    const out = {};
-    for (const n of names) {
-      const v = (user[n] && user[n].value) !== undefined ? user[n].value : (def[n] && def[n].value);
-      out[n] = typeof v === 'boolean' ? v : v === undefined ? true : !!v;
+  function publish(op, vars, json) {
+    if (!json) return;
+    const msg = { op, vars, json, at: Date.now() };
+    feed.recent.push(msg);
+    if (feed.recent.length > 60) feed.recent.shift();
+    for (const fn of [...feed.listeners]) { try { fn(msg); } catch (e) { console.warn('classic', e); } }
+  }
+  /** Calls onData for every answer (also the ones that already arrived) that matches; returns a stop function. */
+  function subscribe(ops, onData, match) {
+    const fn = (msg) => { if (ops.includes(msg.op) && (!match || match(msg))) onData(msg); };
+    feed.listeners.add(fn);
+    for (const msg of feed.recent.slice()) fn(msg);
+    const stop = () => feed.listeners.delete(fn);
+    state.cleanup.push(stop);
+    return stop;
+  }
+  // For troubleshooting from the developer tools: which of X's answers arrived
+  Object.defineProperty(window, '__ranchClassicFeed', { value: () => feed.recent.map((m) => ({ op: m.op, vars: m.vars, at: m.at, json: m.json })), configurable: true });
+  // Listen to X's own requests (installed before X's scripts start)
+  const origFetch = window.fetch;
+  window.fetch = function fetch(input, init) {
+    const p = origFetch.apply(this, arguments);
+    try {
+      const url = typeof input === 'string' ? input : input && input.url;
+      const info = url && describe(url, init && init.body);
+      if (info && WANT.has(info.op)) p.then((res) => res.clone().json()).then((j) => publish(info.op, info.vars, j)).catch(() => {});
+    } catch { /* never break X */ }
+    return p;
+  };
+  const xhrOpen = XMLHttpRequest.prototype.open;
+  const xhrSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function open(method, url) { this.__ranchUrl = url; return xhrOpen.apply(this, arguments); };
+  XMLHttpRequest.prototype.send = function send(body) {
+    try {
+      const info = this.__ranchUrl && describe(this.__ranchUrl, body);
+      if (info && WANT.has(info.op)) {
+        this.addEventListener('load', () => {
+          try { publish(info.op, info.vars, this.responseType === 'json' ? this.response : safeJson(this.responseText)); } catch { /* ignore */ }
+        });
+      }
+    } catch { /* never break X */ }
+    return xhrSend.apply(this, arguments);
+  };
+  for (const [fn, orig] of [[window.fetch, origFetch], [XMLHttpRequest.prototype.open, xhrOpen], [XMLHttpRequest.prototype.send, xhrSend]]) {
+    try { Object.defineProperty(fn, 'toString', { value: () => orig.toString(), configurable: true }); } catch { /* ignore */ }
+  }
+
+  // ---- driving X's hidden page
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function waitUntil(test, ms = 8000) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { const v = test(); if (v) return v; await sleep(150); }
+    return null;
+  }
+  const nativePush = history.pushState.bind(history);
+  /** Moves X's own (hidden) page to a path, as if you'd clicked a link in it. */
+  function xGo(path) {
+    nativePush(null, '', path);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+  }
+  /** Scrolls X's hidden page to the bottom so it loads the next page of tweets. */
+  function xScrollMore() {
+    const se = document.scrollingElement || document.documentElement;
+    se.scrollTop = se.scrollHeight;
+  }
+  const xRoot = () => document.getElementById('react-root') || document.body;
+  function xArticle(id) {
+    for (const a of xRoot().querySelectorAll('article')) {
+      if (a.querySelector(`a[href$="/status/${id}"], a[href*="/status/${id}/"], a[href*="/status/${id}?"]`)) return a;
     }
-    return out;
+    return null;
   }
-  function headers(json) {
-    const h = {
-      authorization: 'Bearer ' + api.bearer,
-      'x-csrf-token': cookie('ct0') || '',
-      'x-twitter-auth-type': 'OAuth2Session',
-      'x-twitter-active-user': 'yes',
-      'x-twitter-client-language': (document.documentElement.lang || 'en').slice(0, 2),
-    };
-    if (json) h['content-type'] = 'application/json';
-    return h;
-  }
-  async function gql(name, variables, opts = {}) {
-    await ensureApi();
-    const op = api.ops[name];
-    if (!op) throw new Error(`X's site doesn't offer ${name} right now`);
-    const features = featureValues(op.features);
-    const fieldToggles = Object.fromEntries(op.toggles.map((t) => [t, false]));
-    const base = `/i/api/graphql/${op.id}/${name}`;
-    const post = () => fetch(base, { method: 'POST', credentials: 'include', headers: headers(true), body: JSON.stringify({ variables, features, fieldToggles, queryId: op.id }) });
-    let res;
-    if (op.type === 'mutation' || opts.post) res = await post();
-    else {
-      const qs = new URLSearchParams({ variables: JSON.stringify(variables), features: JSON.stringify(features), fieldToggles: JSON.stringify(fieldToggles) });
-      res = await fetch(`${base}?${qs}`, { credentials: 'include', headers: headers(false) });
-      if (!res.ok && res.status !== 429 && res.status !== 401) res = await post();
+  /** Runs fn while X's page is on another path, then brings it back. The classic page stays as it is. */
+  async function silently(path, fn) {
+    const back = location.pathname + location.search;
+    state.silent = true;
+    try {
+      xGo(path);
+      return await fn();
+    } finally {
+      await sleep(300);
+      if (location.pathname + location.search !== back) xGo(back);
+      await sleep(200);
+      state.silent = false;
     }
-    if (res.status === 429) throw new Error('X says to slow down. Try again in a minute.');
-    if (!res.ok) throw new Error(`X returned an error (${res.status})`);
-    const j = await res.json();
-    if (j.errors && !j.data) throw new Error(j.errors[0].message || 'X returned an error');
-    return j.data || {};
   }
-  async function rest(path, { method = 'GET', form } = {}) {
-    await ensureApi();
-    const h = headers(false);
-    let body;
-    if (form) { h['content-type'] = 'application/x-www-form-urlencoded'; body = new URLSearchParams(form).toString(); }
-    const res = await fetch(`/i/api/${path}`, { method, credentials: 'include', headers: h, body });
-    if (!res.ok) throw new Error(`X returned an error (${res.status})`);
-    return res.json();
+  /** Finds X's own copy of a tweet (opening it in X's hidden page if needed) and runs fn on it. */
+  async function withXTweet(t, fn) {
+    const here = xArticle(t.id);
+    if (here) return fn(here);
+    return silently(`/${t.user ? t.user.screen : 'i'}/status/${t.id}`, async () => {
+      const art = await waitUntil(() => xArticle(t.id), 9000);
+      if (!art) throw new Error('X didn\'t show that Tweet');
+      return fn(art);
+    });
+  }
+  /** Types into X's own Tweet box and sends it. */
+  async function xSend(text) {
+    const box = await waitUntil(() => document.querySelector('[data-testid="tweetTextarea_0"]'), 9000);
+    if (!box) throw new Error('X\'s Tweet box didn\'t open');
+    box.focus();
+    document.execCommand('insertText', false, text);
+    const btn = await waitUntil(() => {
+      const b = document.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]');
+      return b && !b.disabled && b.getAttribute('aria-disabled') !== 'true' ? b : null;
+    }, 5000);
+    if (!btn) throw new Error('X didn\'t accept the text');
+    btn.click();
+    const gone = await waitUntil(() => !document.querySelector('[data-testid="tweetTextarea_0"]') || null, 10000);
+    if (!gone) throw new Error('X didn\'t send it');
   }
 
   // ==================================================================== data shapes
@@ -153,11 +212,15 @@
       verified: !!(u.is_blue_verified || l.verified || (u.verification && u.verification.verified)),
       locked: !!(l.protected || (u.privacy && u.privacy.protected)),
       bio: l.description || (u.profile_bio && u.profile_bio.description) || '',
-      bioEntities: (l.entities && l.entities.description) || {},
+      bioEntities: (l.entities && l.entities.description) || (u.profile_bio && u.profile_bio.entities && u.profile_bio.entities.description) || {},
       location: (u.location && u.location.location) || l.location || '',
-      url: (l.entities && l.entities.url && l.entities.url.urls && l.entities.url.urls[0]) || null,
+      url: (l.entities && l.entities.url && l.entities.url.urls && l.entities.url.urls[0])
+        || (u.profile_bio && u.profile_bio.entities && u.profile_bio.entities.url && u.profile_bio.entities.url.urls && u.profile_bio.entities.url.urls[0]) || null,
       banner: l.profile_banner_url || (u.banner && u.banner.image_url) || '',
-      followers: l.followers_count, following: l.friends_count, tweets: l.statuses_count, likes: l.favourites_count,
+      followers: l.followers_count != null ? l.followers_count : u.relationship_counts && u.relationship_counts.followers,
+      following: l.friends_count != null ? l.friends_count : u.relationship_counts && u.relationship_counts.following,
+      tweets: l.statuses_count != null ? l.statuses_count : u.tweet_counts && u.tweet_counts.tweets,
+      likes: l.favourites_count != null ? l.favourites_count : u.action_counts && u.action_counts.favorites_count,
       created: core.created_at || l.created_at,
       followed: !!(l.following || (u.relationship_perspectives && u.relationship_perspectives.following)),
     };
@@ -202,6 +265,13 @@
       quote: t.quoted_status_id_str && tweets[t.quoted_status_id_str] ? legacyTweet(tweets[t.quoted_status_id_str], users, {}) : null,
       rt: t.retweeted_status_id_str && tweets[t.retweeted_status_id_str] ? legacyTweet(tweets[t.retweeted_status_id_str], users, tweets) : null,
     };
+  }
+  /** The first "instructions" list found anywhere in an answer (X moves timelines around between versions). */
+  function findInstructions(o, depth = 0) {
+    if (!o || typeof o !== 'object' || depth > 9) return null;
+    if (Array.isArray(o.instructions)) return o.instructions;
+    for (const v of Object.values(o)) { const f = findInstructions(v, depth + 1); if (f) return f; }
+    return null;
   }
   function readTimeline(instructions) {
     const items = [];
@@ -260,7 +330,8 @@
     active: false,
     night: (() => { try { return localStorage.getItem('ranch-classic-night') === '1'; } catch { return false; } })(),
     cache: new Map(), // tweet id -> tweet
-    renderToken: 0,
+    cleanup: [], // what to stop when leaving a page
+    silent: false, // X's page is away doing something for us (a like, a reply…)
   };
 
   // ==================================================================== the shell
@@ -284,6 +355,7 @@
     if (host) return;
     host = document.createElement('div');
     host.id = 'ranch-classic-host';
+    host.style.cssText = 'position:fixed;inset:0;z-index:2147483000;';
     const shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `<style>${CSS}</style><div class="app ${state.night ? 'night' : ''}">
       <header class="top"><div class="top-in">
@@ -323,29 +395,34 @@
   }
 
   // ==================================================================== navigation
-  const nativePush = history.pushState.bind(history);
-  function go(url, replace) {
+  // Every move also moves X's hidden page, which then loads the data the classic page shows.
+  function go(url) {
     const u = new URL(url, location.href);
     if (u.origin !== location.origin) { bridge.openOutside && bridge.openOutside(u.href); return; }
-    if (!routeOf(u.pathname)) { location.assign(u.href); return; } // X's own page
-    if (replace) history.replaceState(null, '', u.href); else nativePush(null, '', u.href);
-    route();
+    // A Tweet's page: X often reuses what it has instead of loading the conversation, so load it fresh
+    const r = routeOf(u.pathname);
+    if (r && r.page === 'tweet') { location.assign(u.pathname); return; }
+    xGo(u.pathname + u.search);
   }
+  function cleanup() { for (const fn of state.cleanup.splice(0)) { try { fn(); } catch { /* ignore */ } } }
+  let lastPath = null;
   function route() {
+    if (state.silent) return;
     const r = signedIn() ? routeOf(location.pathname) : null;
+    if (location.pathname === lastPath && state.active && r) return; // same page (e.g. X tidying its URL)
+    lastPath = location.pathname;
+    cleanup();
     if (!r) { setActive(false); return; }
     mountShell();
     setActive(true);
+    viewer();
     for (const a of root.querySelectorAll('.nav')) a.classList.toggle('on', a.dataset.nav === r.page);
-    const token = ++state.renderToken;
     root.scrollTop = 0;
-    viewer().catch(() => {});
-    main.innerHTML = '<div class="loading"><span></span></div>';
-    const done = (p) => p.catch((e) => { if (token === state.renderToken) showError(e); });
-    if (r.page === 'home') done(pageHome(token));
-    else if (r.page === 'profile') done(pageProfile(r, token));
-    else if (r.page === 'tweet') done(pageTweet(r, token));
-    else if (r.page === 'notifications') done(pageNotifications(r, token));
+    const done = (p) => Promise.resolve(p).catch((e) => showError(e));
+    if (r.page === 'home') done(pageHome());
+    else if (r.page === 'profile') done(pageProfile(r));
+    else if (r.page === 'tweet') done(pageTweet(r));
+    else if (r.page === 'notifications') done(pageNotifications(r));
   }
   function showError(e) {
     main.innerHTML = `<div class="wide"><div class="card error"><h3>Couldn't load this page</h3><p>${esc(e.message || e)}</p>
@@ -355,16 +432,15 @@
   for (const k of ['pushState', 'replaceState']) {
     const orig = history[k];
     history[k] = function (...args) {
-      const before = location.pathname;
       const r = orig.apply(this, args);
-      if (location.pathname !== before) setTimeout(() => { const rt = signedIn() && routeOf(location.pathname); if (rt || state.active) route(); }, 0);
+      setTimeout(() => route(), 0);
       return r;
     };
   }
-  window.addEventListener('popstate', () => route());
+  window.addEventListener('popstate', () => setTimeout(() => route(), 0));
 
   // ==================================================================== rendering pieces
-  const avatar = (u, size, cls) => `<img class="av ${cls || ''}" src="${esc(u && u.avatar)}" alt="" width="${size}" height="${size}" loading="lazy">`;
+  const avatar = (u, size, cls) => `<img class="av ${cls || ''}" src="${esc(u && u.avatar)}" alt="" width="${size}" height="${size}">`;
   const badge = (u) => (u && u.verified ? `<span class="verified" title="Verified account">${svg('check')}</span>` : '') + (u && u.locked ? '<span class="lock" title="Protected Tweets">🔒</span>' : '');
   function mediaHtml(media) {
     if (!media || !media.length) return '';
@@ -473,71 +549,169 @@
   }
 
   // ==================================================================== viewer
-  async function viewer() {
-    if (state.me) return state.me;
-    const st = window.__INITIAL_STATE__ || {};
-    const id = (st.session && st.session.user_id) || (cookie('twid') || '').replace(/^u=/, '');
-    let screen = st.entities && st.entities.users && st.entities.users.entities && st.entities.users.entities[id] && st.entities.users.entities[id].screen_name;
-    let u = null;
-    try {
-      if (screen) u = normUser((await gql('UserByScreenName', { screen_name: screen, withGrokTranslatedBio: false })).user);
-      else if (id && api.ops.UserByRestId !== undefined) u = normUser((await gql('UserByRestId', { userId: id, withSafetyModeUserFields: true })).user);
-    } catch { /* show what we have */ }
-    state.me = u || { id, screen: screen || '', name: screen || '', avatar: '' };
-    const img = root.querySelector('.me img');
-    if (img) img.src = state.me.avatar || '';
-    return state.me;
+  // Who you are: from X's own account button, plus your profile once it has loaded once.
+  function viewer() {
+    let cached = null;
+    try { cached = JSON.parse(localStorage.getItem('ranch-classic-me') || 'null'); } catch { /* ignore */ }
+    const btn = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
+    let fromX = null;
+    const link = document.querySelector('[data-testid="AppTabBar_Profile_Link"]');
+    const lines = btn ? (btn.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean) : [];
+    const screen = (lines.find((s) => s.startsWith('@')) || '').slice(1) || (link ? (link.getAttribute('href') || '').replace(/^\//, '') : '');
+    if (screen) {
+      const img = (btn && btn.querySelector('img')) || document.querySelector(`[data-testid="UserAvatar-Container-${screen}"] img`);
+      fromX = { screen, name: lines.find((s) => !s.startsWith('@')) || screen, avatar: img ? img.src.replace(/_(normal|x96|mini)\./, '_bigger.') : '' };
+    }
+    const me = fromX && cached && cached.screen.toLowerCase() === fromX.screen.toLowerCase() ? { ...cached, ...fromX, avatar: fromX.avatar || cached.avatar }
+      : fromX || cached || { screen: '', name: '', avatar: '' };
+    state.me = me;
+    const img = root && root.querySelector('.me img');
+    if (img && me.avatar && img.src !== me.avatar) img.src = me.avatar;
+    return me;
+  }
+  function rememberMe(u) {
+    const me = viewer();
+    if (!u || !me.screen || u.screen.toLowerCase() !== me.screen.toLowerCase()) return;
+    try { localStorage.setItem('ranch-classic-me', JSON.stringify(u)); } catch { /* ignore */ }
+    state.me = { ...u, avatar: me.avatar || u.avatar };
   }
 
+  // ==================================================================== a stream of tweets that grows
+  // Shows tweets as X's page loads them; scrolling to the bottom makes X's page load more.
+  function liveStream(container, { ops, match, read, onFirst }) {
+    const seen = new Set();
+    let gotAny = false;
+    let lastGrowth = 0;
+    const loading = document.createElement('div');
+    loading.className = 'loading';
+    loading.innerHTML = '<span></span>';
+    container.appendChild(loading);
+    const add = (items) => {
+      const fresh = items.filter((i) => i.kind !== 'tweet' || !seen.has((i.tweet.rt || i.tweet).id));
+      for (const i of fresh) if (i.kind === 'tweet') seen.add((i.tweet.rt || i.tweet).id);
+      if (!fresh.length) return;
+      lastGrowth = Date.now();
+      loading.insertAdjacentHTML('beforebegin', fresh.map((i) => (i.html ? i.html : tweetHtml(i))).join(''));
+    };
+    const ctrl = {
+      add: (items) => add(items),
+      reset: () => { seen.clear(); for (const el of container.querySelectorAll(':scope > article, :scope > .notif')) el.remove(); },
+    };
+    subscribe(ops, (msg) => {
+      const items = read(msg, ctrl);
+      if (!items) return;
+      if (!gotAny) { gotAny = true; if (onFirst) onFirst(msg); }
+      add(items);
+      loading.innerHTML = '';
+    }, match);
+    // Infinite scroll
+    const io = new IntersectionObserver(async (entries) => {
+      if (!entries[0].isIntersecting || !gotAny) return;
+      const before = lastGrowth;
+      loading.innerHTML = '<span></span>';
+      xScrollMore();
+      const grew = await waitUntil(() => lastGrowth !== before, 6000);
+      loading.innerHTML = grew ? '' : '';
+    }, { rootMargin: '700px' });
+    io.observe(loading);
+    state.cleanup.push(() => io.disconnect());
+    // Nothing arrived? X reuses what it already has in memory instead of asking again, so the
+    // classic page sees nothing new: reload once (X then loads it fresh). Still nothing? Say so.
+    const key = `ranch-classic-reloaded:${location.pathname}`;
+    const reloadTimer = setTimeout(() => {
+      if (gotAny || !loading.isConnected) return;
+      let done = false;
+      try { done = sessionStorage.getItem(key) === '1'; sessionStorage.setItem(key, '1'); } catch { /* ignore */ }
+      if (!done) location.reload();
+      else loading.innerHTML = '<p class="dim center">X didn\'t load this. <button type="button" class="btn ghost" data-act="retry">Reload</button></p>';
+    }, 4000);
+    state.cleanup.push(() => clearTimeout(reloadTimer));
+    subscribe(ops, () => { try { sessionStorage.removeItem(key); } catch { /* ignore */ } }, match);
+    return ctrl;
+  }
+  const timelineOf = (json, path) => {
+    let o = json && json.data;
+    for (const k of path) o = o && o[k];
+    return o && o.instructions;
+  };
+
   // ==================================================================== pages
-  async function pageHome(token) {
-    const me = await viewer();
-    main.innerHTML = `<div class="cols">
-      <aside class="side">
-        <div class="card dash">
+  function dashHtml(me) {
+    const stat = (n) => (n != null ? compact(n) || 0 : '–');
+    return `<aside class="side">
+        <div class="card dash" data-screen="${esc(me.screen)}">
           <a href="/${esc(me.screen)}" data-route class="dash-banner" style="${me.banner ? `background-image:url('${esc(me.banner)}/600x200')` : ''}"></a>
           <div class="dash-body">
             <a href="/${esc(me.screen)}" data-route>${avatar(me, 72, 'dash-av')}</a>
             <a href="/${esc(me.screen)}" data-route class="dash-name"><b>${esc(me.name)}</b><span class="dim">@${esc(me.screen)}</span></a>
             <div class="dash-stats">
-              <a href="/${esc(me.screen)}" data-route><span class="dim">Tweets</span><b>${compact(me.tweets) || 0}</b></a>
-              <a href="/${esc(me.screen)}/following" data-x><span class="dim">Following</span><b>${compact(me.following) || 0}</b></a>
-              <a href="/${esc(me.screen)}/followers" data-x><span class="dim">Followers</span><b>${compact(me.followers) || 0}</b></a>
+              <a href="/${esc(me.screen)}" data-route><span class="dim">Tweets</span><b>${stat(me.tweets)}</b></a>
+              <a href="/${esc(me.screen)}/following" data-x><span class="dim">Following</span><b>${stat(me.following)}</b></a>
+              <a href="/${esc(me.screen)}/followers" data-x><span class="dim">Followers</span><b>${stat(me.followers)}</b></a>
             </div>
           </div>
         </div>
-      </aside>
+      </aside>`;
+  }
+  async function pageHome() {
+    const me = viewer();
+    main.innerHTML = `<div class="cols">
+      ${dashHtml(me)}
       <section class="center">
         <div class="card composer-inline">${avatar(me, 32)}<button type="button" class="fake-input" data-act="compose">What's happening?</button></div>
         <div class="card stream"></div>
       </section>
       <aside class="side right">${footerHtml()}</aside>
     </div>`;
-    const stream = main.querySelector('.stream');
-    let cursor = null;
-    const load = async () => {
-      const vars = { count: 20, includePromotedContent: false, latestControlAvailable: true, requestContext: 'launch' };
-      if (cursor) vars.cursor = cursor;
-      const data = await gql('HomeLatestTimeline', vars, { post: true });
-      if (token !== state.renderToken) return false;
-      const tl = data.home && data.home.home_timeline_urt;
-      const { items, bottom } = readTimeline(tl && tl.instructions);
-      stream.querySelector('.more')?.insertAdjacentHTML('beforebegin', streamHtml(items));
-      const added = items.length > 0 && bottom && bottom !== cursor;
-      cursor = bottom;
-      return added;
-    };
-    stream.innerHTML = '';
-    moreLoader(stream, load);
+    // X fills in its account button a moment after the page starts: redraw the card then
+    if (!me.screen || me.tweets == null) {
+      const started = Date.now();
+      const t = setInterval(() => {
+        const now = viewer();
+        const card = main.querySelector('.dash');
+        if (!card || Date.now() - started > 30000) { clearInterval(t); return; }
+        if (now.screen && (card.dataset.screen !== now.screen || (now.tweets != null && me.tweets == null))) {
+          clearInterval(t);
+          if (state.active && routeOf(location.pathname) && routeOf(location.pathname).page === 'home') {
+            const old = main.querySelector('.side:not(.right)');
+            const tmp = document.createElement('div');
+            tmp.innerHTML = dashHtml(now);
+            if (old) old.replaceWith(tmp.firstElementChild);
+          }
+        }
+      }, 700);
+      state.cleanup.push(() => clearInterval(t));
+    }
+    let latest = false;
+    liveStream(main.querySelector('.stream'), {
+      ops: ['HomeLatestTimeline', 'HomeTimeline'],
+      read: (msg, s) => {
+        // Prefer the Following (latest) timeline; drop "For you" once Following arrives
+        if (msg.op === 'HomeLatestTimeline' && !latest) { latest = true; s.reset(); }
+        if (msg.op === 'HomeTimeline' && latest) return null;
+        return readTimeline(timelineOf(msg.json, ['home', 'home_timeline_urt']) || findInstructions(msg.json && msg.json.data)).items;
+      },
+    });
   }
 
-  async function pageProfile(r, token) {
-    const data = await gql('UserByScreenName', { screen_name: r.screen, withGrokTranslatedBio: false });
-    if (token !== state.renderToken) return;
-    const u = normUser(data.user);
-    if (!u) { main.innerHTML = `<div class="wide"><div class="card error"><h3>Sorry, that page doesn't exist!</h3><p>@${esc(r.screen)} isn't available.</p></div></div>`; return; }
-    const me = await viewer();
-    const isMe = me && me.id === u.id;
+  async function pageProfile(r) {
+    main.innerHTML = '<div class="loading"><span></span></div>';
+    const same = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
+    let shown = null;
+    subscribe(['UserByScreenName'], (msg) => {
+      const u = normUser(msg.json && msg.json.data && msg.json.data.user);
+      if (!u || shown === u.id) return;
+      shown = u.id;
+      rememberMe(u);
+      renderProfile(r, u);
+    }, (msg) => same(msg.vars.screen_name, r.screen));
+    setTimeout(() => {
+      if (!shown && main.querySelector('.loading')) main.innerHTML = `<div class="wide"><div class="card error"><h3>Sorry, that page doesn't exist!</h3><p>@${esc(r.screen)} didn't load. <button type="button" class="btn ghost" data-act="retry">Try again</button></p></div></div>`;
+    }, 15000);
+  }
+  function renderProfile(r, u) {
+    const me = viewer();
+    const isMe = me && me.screen && same2(me.screen, u.screen);
     const joined = u.created ? new Date(u.created).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : '';
     const url = u.url ? `<div class="p-line">${svg('link')}<a href="${esc(u.url.expanded_url)}" data-outside>${esc(u.url.display_url)}</a></div>` : '';
     main.innerHTML = `<div class="profile">
@@ -545,13 +719,13 @@
       <div class="p-nav"><div class="p-nav-in">
         <div class="p-av-wrap">${avatar({ avatar: u.avatar.replace('_bigger.', '_400x400.') }, 200, 'p-av')}</div>
         <div class="p-counts">
-          <a href="/${esc(u.screen)}" data-route class="${r.tab !== 'likes' ? 'on' : ''}"><span>Tweets</span><b>${full(u.tweets)}</b></a>
+          <a href="/${esc(u.screen)}" data-route class="on"><span>Tweets</span><b>${full(u.tweets)}</b></a>
           <a href="/${esc(u.screen)}/following" data-x><span>Following</span><b>${full(u.following)}</b></a>
           <a href="/${esc(u.screen)}/followers" data-x><span>Followers</span><b>${full(u.followers)}</b></a>
           <a href="/${esc(u.screen)}/likes" data-x><span>Likes</span><b>${full(u.likes)}</b></a>
         </div>
         <div class="p-actions">${isMe ? '<a href="/settings/profile" data-x class="btn ghost">Edit profile</a>'
-          : `<button type="button" class="btn ${u.followed ? 'following' : 'ghost'}" data-act="follow" data-user="${esc(u.id)}" data-on="${u.followed ? 1 : 0}">${u.followed ? 'Following' : 'Follow'}</button>`}</div>
+          : `<button type="button" class="btn ${u.followed ? 'following' : 'ghost'}" data-act="follow" data-on="${u.followed ? 1 : 0}">${u.followed ? 'Following' : 'Follow'}</button>`}</div>
       </div></div>
       <div class="cols">
         <aside class="side p-info">
@@ -577,153 +751,133 @@
     </div>`;
     const stream = main.querySelector('.stream');
     if (u.locked && !u.followed && !isMe) { stream.innerHTML = `<div class="empty"><h3>This account's Tweets are protected.</h3><p class="dim">Only confirmed followers have access to @${esc(u.screen)}'s Tweets.</p></div>`; return; }
-    const op = r.tab === 'with_replies' ? 'UserTweetsAndReplies' : r.tab === 'media' ? 'UserMedia' : 'UserTweets';
-    let cursor = null;
-    const load = async () => {
-      const vars = { userId: u.id, count: 20, includePromotedContent: false, withQuickPromoteEligibilityTweetFields: false, withVoice: true, withCommunity: true, withClientEventToken: false, withBirdwatchNotes: false, withV2Timeline: true };
-      if (cursor) vars.cursor = cursor;
-      const d = await gql(op, vars);
-      if (token !== state.renderToken) return false;
-      const res = d.user && d.user.result;
-      const tl = res && ((res.timeline_v2 && res.timeline_v2.timeline) || (res.timeline && res.timeline.timeline));
-      let { items, bottom } = readTimeline(tl && tl.instructions);
-      // Media tab: also read the grid module
-      if (op === 'UserMedia' && tl) {
-        for (const ins of tl.instructions || []) for (const it of ins.moduleItems || []) {
-          const t = it.item && it.item.itemContent && it.item.itemContent.tweet_results && normTweet(it.item.itemContent.tweet_results.result);
-          if (t) items.push({ kind: 'tweet', tweet: t });
+    // X renamed these in 2026; the old names stay as a fallback
+    const ops = r.tab === 'with_replies' ? ['UserRepliesTimeline', 'UserTweetsAndReplies']
+      : r.tab === 'media' ? ['UserVideoTimeline', 'UserMediaTimeline', 'UserMedia'] : ['UserOriginalsTimeline', 'UserTweets'];
+    liveStream(stream, {
+      ops,
+      match: (msg) => String(msg.vars.userId || msg.vars.user_id || msg.vars.rest_id || '') === String(u.id),
+      read: (msg) => {
+        const instructions = findInstructions(msg.json && msg.json.data);
+        const { items } = readTimeline(instructions);
+        if (r.tab === 'media' && instructions) {
+          for (const ins of instructions) for (const it of ins.moduleItems || []) {
+            const t = it.item && it.item.itemContent && it.item.itemContent.tweet_results && normTweet(it.item.itemContent.tweet_results.result);
+            if (t) items.push({ kind: 'tweet', tweet: t });
+          }
         }
-      }
-      stream.querySelector('.more')?.insertAdjacentHTML('beforebegin', streamHtml(items.map((i) => ({ ...i, showReplying: true }))));
-      const added = items.length > 0 && bottom && bottom !== cursor;
-      cursor = bottom;
-      return added;
-    };
-    moreLoader(stream, load);
+        return items;
+      },
+    });
   }
+  const same2 = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
 
-  async function pageTweet(r, token) {
-    const vars = { focalTweetId: r.id, with_rux_injections: false, rankingMode: 'Relevance', includePromotedContent: false, withCommunity: true, withQuickPromoteEligibilityTweetFields: false, withBirdwatchNotes: false, withVoice: true };
-    const data = await gql('TweetDetail', vars);
-    if (token !== state.renderToken) return;
-    const tl = data.threaded_conversation_with_injections_v2;
-    const { items, bottom } = readTimeline(tl && tl.instructions);
-    const ix = items.findIndex((i) => i.tweet && i.tweet.id === r.id);
-    const before = ix > 0 ? items.slice(0, ix) : [];
-    const focal = ix >= 0 ? items[ix].tweet : null;
-    const after = ix >= 0 ? items.slice(ix + 1) : items;
-    if (!focal) throw new Error('This Tweet is unavailable.');
-    main.innerHTML = `<div class="wide"><div class="card conv">
-      <div class="ancestors">${before.map((i) => tweetHtml({ ...i, threadPart: true, threadEnd: false })).join('')}</div>
-      ${focalHtml(focal)}
-      <div class="card composer-inline reply-box">${avatar(state.me || {}, 32)}<button type="button" class="fake-input" data-act="reply" data-id="${focal.id}">Tweet your reply</button></div>
-      <div class="stream">${streamHtml(after)}</div>
-    </div></div>`;
-    document.title = `${focal.user ? focal.user.name : ''} on Twitter`;
-    let cursor = bottom;
-    if (cursor) {
-      moreLoader(main.querySelector('.stream'), async () => {
-        const d = await gql('TweetDetail', { ...vars, cursor, referrer: 'tweet' });
-        if (token !== state.renderToken) return false;
-        const t2 = d.threaded_conversation_with_injections_v2;
-        const res = readTimeline(t2 && t2.instructions);
-        main.querySelector('.stream .more')?.insertAdjacentHTML('beforebegin', streamHtml(res.items.filter((i) => i.tweet.id !== r.id)));
-        const added = res.items.length > 0 && res.bottom && res.bottom !== cursor;
-        cursor = res.bottom;
-        return added;
-      });
-    }
+  async function pageTweet(r) {
+    main.innerHTML = `<div class="wide"><div class="card conv"><div class="ancestors"></div><div class="focal-slot"><div class="loading"><span></span></div></div>
+      <div class="card composer-inline reply-box" hidden>${avatar(viewer(), 32)}<button type="button" class="fake-input" data-act="reply" data-id="${esc(r.id)}">Tweet your reply</button></div>
+      <div class="stream"></div></div></div>`;
+    let focalShown = false;
+    const stream = main.querySelector('.conv .stream');
+    liveStream(stream, {
+      ops: ['TweetDetail'],
+      match: (msg) => String(msg.vars.focalTweetId) === String(r.id),
+      read: (msg) => {
+        const tl = msg.json && msg.json.data && msg.json.data.threaded_conversation_with_injections_v2;
+        const { items } = readTimeline((tl && tl.instructions) || findInstructions(msg.json && msg.json.data));
+        const ix = items.findIndex((i) => i.tweet && i.tweet.id === r.id);
+        if (ix >= 0 && !focalShown) {
+          focalShown = true;
+          main.querySelector('.ancestors').innerHTML = items.slice(0, ix).map((i) => tweetHtml({ ...i, threadPart: true, threadEnd: false })).join('');
+          main.querySelector('.focal-slot').innerHTML = focalHtml(items[ix].tweet);
+          main.querySelector('.reply-box').hidden = false;
+          document.title = `${items[ix].tweet.user ? items[ix].tweet.user.name : ''} on Twitter`;
+          return items.slice(ix + 1);
+        }
+        return items.filter((i) => !(i.tweet && i.tweet.id === r.id));
+      },
+    });
   }
 
   const NOTIF_ICON = { heart_icon: 'heart', retweet_icon: 'retweet', person_icon: 'person', bird_icon: 'bird', reply_icon: 'reply', bell_icon: 'bell' };
-  async function pageNotifications(r, token) {
+  async function pageNotifications(r) {
     main.innerHTML = `<div class="wide"><div class="card">
       <h2 class="card-title">Notifications</h2>
       <nav class="tabs"><a href="/notifications" data-route class="${r.tab === 'all' ? 'on' : ''}">All</a><a href="/notifications/mentions" data-route class="${r.tab === 'mentions' ? 'on' : ''}">Mentions</a></nav>
       <div class="stream"></div></div></div>`;
-    const stream = main.querySelector('.stream');
-    let cursor = null;
-    let useGraphql = false;
-    const loadRest = async () => {
-      const qs = new URLSearchParams({ include_profile_interstitial_type: '1', include_blocking: '1', include_blocked_by: '1', include_followed_by: '1',
-        include_want_retweets: '1', include_mute_edge: '1', include_can_dm: '1', skip_status: '1', cards_platform: 'Web-12', include_cards: '1',
-        include_ext_alt_text: 'true', include_quote_count: 'true', include_reply_count: '1', tweet_mode: 'extended', include_entities: 'true',
-        include_user_entities: 'true', send_error_codes: 'true', simple_quoted_tweet: 'true', count: '20' });
-      if (cursor) qs.set('cursor', cursor);
-      const d = await rest(`2/notifications/${r.tab === 'mentions' ? 'mentions' : 'all'}.json?${qs}`);
-      const g = d.globalObjects || {};
-      const users = g.users || {};
-      const tweets = g.tweets || {};
-      const notes = g.notifications || {};
-      let html = '';
-      let bottom = null;
-      for (const ins of (d.timeline && d.timeline.instructions) || []) {
-        for (const e of (ins.addEntries && ins.addEntries.entries) || []) {
-          const c = e.content || {};
-          if (c.operation && c.operation.cursor) { if (c.operation.cursor.cursorType === 'Bottom') bottom = c.operation.cursor.value; continue; }
-          const item = c.item && c.item.content;
-          if (!item) continue;
-          if (item.tweet && tweets[item.tweet.id]) html += tweetHtml({ kind: 'tweet', tweet: legacyTweet(tweets[item.tweet.id], users, tweets) });
-          else if (item.notification && notes[item.notification.id]) {
-            const n = notes[item.notification.id];
-            const tpl = (n.template && n.template.aggregateUserActionsV1) || {};
-            const from = (tpl.fromUsers || []).map((x) => users[x.user && x.user.id]).filter(Boolean).slice(0, 8);
-            const target = (tpl.targetObjects || []).map((x) => x.tweet && tweets[x.tweet.id]).filter(Boolean)[0];
-            html += notificationHtml(NOTIF_ICON[n.icon && n.icon.id] || 'bell', n.message && n.message.text, from.map((x) => normUser({ legacy: x, rest_id: x.id_str })),
-              target ? legacyTweet(target, users, tweets) : null, n.timestampMs);
-          }
-        }
-      }
-      return { html, bottom };
-    };
-    const loadGraphql = async () => {
-      const vars = { timeline_type: r.tab === 'mentions' ? 'Mentions' : 'All', count: 20 };
-      if (cursor) vars.cursor = cursor;
-      const d = await gql('NotificationsTimeline', vars);
-      const tl = d.viewer_v2 && d.viewer_v2.user_results && d.viewer_v2.user_results.result && d.viewer_v2.user_results.result.notification_timeline && d.viewer_v2.user_results.result.notification_timeline.timeline;
-      const { items, bottom } = readTimeline(tl && tl.instructions);
-      let html = '';
-      for (const it of items) {
-        if (it.kind === 'tweet') html += tweetHtml(it);
-        else {
-          const n = it.n;
-          const tpl = n.template || {};
-          const from = (tpl.from_users || []).map((x) => normUser(x.user_results)).filter(Boolean);
-          const target = (tpl.target_objects || []).map((x) => x.tweet_results && normTweet(x.tweet_results.result)).filter(Boolean)[0];
-          html += notificationHtml(NOTIF_ICON[n.notification_icon] || 'bell', n.rich_message && n.rich_message.text, from, target, n.timestamp_ms);
-        }
-      }
-      return { html, bottom };
-    };
-    moreLoader(stream, async () => {
-      let res;
-      if (!useGraphql) { try { res = await loadRest(); } catch (e) { if (!api.ops.NotificationsTimeline) throw e; useGraphql = true; } }
-      if (useGraphql) res = await loadGraphql();
-      if (token !== state.renderToken) return false;
-      stream.querySelector('.more')?.insertAdjacentHTML('beforebegin', res.html || (cursor ? '' : '<div class="empty"><p class="dim">Nothing to see here yet.</p></div>'));
-      const added = !!res.html && res.bottom && res.bottom !== cursor;
-      cursor = res.bottom;
-      return added;
+    const kind = r.tab === 'mentions' ? 'Mentions' : 'All';
+    liveStream(main.querySelector('.stream'), {
+      ops: ['NotificationsTimeline', `rest:notifications/${r.tab === 'mentions' ? 'mentions' : 'all'}`],
+      match: (msg) => msg.op.startsWith('rest:') || !msg.vars.timeline_type || msg.vars.timeline_type === kind,
+      read: (msg) => (msg.op.startsWith('rest:') ? readRestNotifications(msg.json) : readGraphqlNotifications(msg.json)),
     });
+  }
+  function readGraphqlNotifications(json) {
+    const d = (json && json.data) || {};
+    const res = d.viewer_v2 && d.viewer_v2.user_results && d.viewer_v2.user_results.result;
+    const tl = (res && res.notification_timeline && res.notification_timeline.timeline) || (d.viewer && d.viewer.notification_timeline && d.viewer.notification_timeline.timeline);
+    const { items } = readTimeline((tl && tl.instructions) || findInstructions(d));
+    return items.map((it) => {
+      if (it.kind === 'tweet') return it;
+      const n = it.n;
+      const tpl = n.template || {};
+      const from = (tpl.from_users || []).map((x) => normUser(x.user_results)).filter(Boolean);
+      const target = (tpl.target_objects || []).map((x) => x.tweet_results && normTweet(x.tweet_results.result)).filter(Boolean)[0];
+      return { kind: 'notification', html: notificationHtml(NOTIF_ICON[n.notification_icon] || 'bell', n.rich_message && n.rich_message.text, from, target, n.timestamp_ms) };
+    });
+  }
+  function readRestNotifications(d) {
+    const g = (d && d.globalObjects) || {};
+    const users = g.users || {};
+    const tweets = g.tweets || {};
+    const notes = g.notifications || {};
+    const out = [];
+    for (const ins of (d && d.timeline && d.timeline.instructions) || []) {
+      for (const e of (ins.addEntries && ins.addEntries.entries) || []) {
+        const item = e.content && e.content.item && e.content.item.content;
+        if (!item) continue;
+        if (item.tweet && tweets[item.tweet.id]) out.push({ kind: 'tweet', tweet: legacyTweet(tweets[item.tweet.id], users, tweets) });
+        else if (item.notification && notes[item.notification.id]) {
+          const n = notes[item.notification.id];
+          const tpl = (n.template && n.template.aggregateUserActionsV1) || {};
+          const from = (tpl.fromUsers || []).map((x) => users[x.user && x.user.id]).filter(Boolean).slice(0, 8);
+          const target = (tpl.targetObjects || []).map((x) => x.tweet && tweets[x.tweet.id]).filter(Boolean)[0];
+          out.push({ kind: 'notification', html: notificationHtml(NOTIF_ICON[n.icon && n.icon.id] || 'bell', n.message && n.message.text,
+            from.map((x) => normUser({ legacy: x, rest_id: x.id_str })), target ? legacyTweet(target, users, tweets) : null, n.timestampMs) });
+        }
+      }
+    }
+    return out;
+  }
+  // Old Twitter named who did it: "Name followed you", "Name and 3 others liked your Tweet"
+  function notifText(text, users) {
+    text = String(text || '').trim();
+    const first = users[0];
+    if (!first || !first.name || text.startsWith(first.name)) return esc(text);
+    const others = users.length > 1 ? ` and ${users.length - 1} other${users.length > 2 ? 's' : ''}` : '';
+    return `<b>${esc(first.name)}</b>${esc(others)} ${esc(text)}`;
   }
   function notificationHtml(icon, text, users, target, ts) {
     return `<div class="notif" ${target ? `data-open="/${esc(target.user && target.user.screen)}/status/${target.id}"` : ''}>
       <div class="n-icon ${icon}">${svg(icon === 'heart' ? 'heartFull' : icon)}</div>
       <div class="n-body">
         <div class="n-avs">${users.map((u) => `<a href="/${esc(u.screen)}" data-route title="${esc(u.name)}">${avatar(u, 32)}</a>`).join('')}</div>
-        <div class="n-text">${esc(text || '')}${ts ? ` <span class="dim">· ${esc(ago(Number(ts)))}</span>` : ''}</div>
+        <div class="n-text">${notifText(text, users)}${toDate(ts) ? ` <span class="dim">· ${esc(ago(ts))}</span>` : ''}</div>
         ${target ? `<div class="n-target dim">${renderText(target.text, target.entities, target.range)}</div>` : ''}
       </div></div>`;
   }
 
-  // ==================================================================== actions
-  async function toggleLike(btn, t) {
+  // ==================================================================== actions (X's own buttons)
+  async function toggleLike(t) {
     const on = !t.liked;
     t.liked = on;
     t.likes = (t.likes || 0) + (on ? 1 : -1);
     paintActions(t);
-    try { await gql(on ? 'FavoriteTweet' : 'UnfavoriteTweet', { tweet_id: t.id }); }
-    catch (e) { t.liked = !on; t.likes += on ? -1 : 1; paintActions(t); toast(`Couldn't ${on ? 'like' : 'unlike'}: ${e.message}`); }
+    try {
+      await withXTweet(t, async (art) => {
+        const b = art.querySelector(on ? '[data-testid="like"]' : '[data-testid="unlike"]');
+        if (b) b.click(); // already in the wanted state otherwise
+      });
+    } catch (e) { t.liked = !on; t.likes += on ? -1 : 1; paintActions(t); toast(`Couldn't ${on ? 'like' : 'unlike'}: ${e.message}`); }
   }
   async function toggleRetweet(t) {
     const on = !t.retweeted;
@@ -731,8 +885,14 @@
     t.retweets = (t.retweets || 0) + (on ? 1 : -1);
     paintActions(t);
     try {
-      if (on) await gql('CreateRetweet', { tweet_id: t.id, dark_request: false });
-      else await gql('DeleteRetweet', { source_tweet_id: t.id, dark_request: false });
+      await withXTweet(t, async (art) => {
+        const b = art.querySelector(on ? '[data-testid="retweet"]' : '[data-testid="unretweet"]');
+        if (!b) return;
+        b.click();
+        const confirm = await waitUntil(() => document.querySelector(on ? '[data-testid="retweetConfirm"]' : '[data-testid="unretweetConfirm"]'), 4000);
+        if (!confirm) throw new Error('X\'s Retweet menu didn\'t open');
+        confirm.click();
+      });
       toast(on ? 'Retweeted' : 'Retweet removed');
     } catch (e) { t.retweeted = !on; t.retweets += on ? -1 : 1; paintActions(t); toast(`Couldn't retweet: ${e.message}`); }
   }
@@ -754,7 +914,11 @@
     const on = btn.dataset.on !== '1';
     btn.disabled = true;
     try {
-      await rest(`1.1/friendships/${on ? 'create' : 'destroy'}.json`, { method: 'POST', form: { user_id: btn.dataset.user, include_profile_interstitial_type: '1' } });
+      // X's own profile page is open underneath; use its Follow button
+      const xb = await waitUntil(() => xRoot().querySelector(on ? '[data-testid$="-follow"]' : '[data-testid$="-unfollow"]'), 5000);
+      if (!xb) throw new Error('X\'s Follow button isn\'t there');
+      xb.click();
+      if (!on) { const c = await waitUntil(() => document.querySelector('[data-testid="confirmationSheetConfirm"]'), 4000); if (c) c.click(); }
       btn.dataset.on = on ? '1' : '0';
       btn.textContent = on ? 'Following' : 'Follow';
       btn.className = `btn ${on ? 'following' : 'ghost'}`;
@@ -763,9 +927,10 @@
   }
 
   // ==================================================================== composer
+  // Our 2018-style box; sending types the text into X's own Tweet box and presses its button.
   function openComposer({ replyTo, quote } = {}) {
     const wrap = root.querySelector('.modal-wrap');
-    const me = state.me || {};
+    const me = viewer();
     const title = replyTo ? `Reply to ${esc(replyTo.user ? replyTo.user.name : '')}` : quote ? 'Quote Tweet' : 'Compose new Tweet';
     wrap.innerHTML = `<div class="modal" role="dialog" aria-label="${title}">
       <div class="m-head"><h3>${title}</h3><button type="button" class="x" data-act="close" aria-label="Close">×</button></div>
@@ -786,23 +951,38 @@
       send.disabled = !ta.value.trim() || left < 0;
     });
     send.addEventListener('click', async () => {
+      const text = ta.value;
       send.disabled = true;
       send.textContent = 'Sending…';
-      const vars = { tweet_text: ta.value, dark_request: false, media: { media_entities: [], possibly_sensitive: false }, semantic_annotation_ids: [] };
-      if (replyTo) vars.reply = { in_reply_to_tweet_id: replyTo.id, exclude_reply_user_ids: [] };
-      if (quote) vars.attachment_url = `https://x.com/${quote.user ? quote.user.screen : 'i'}/status/${quote.id}`;
       try {
-        const d = await gql('CreateTweet', vars);
-        const t = d.create_tweet && d.create_tweet.tweet_results && normTweet(d.create_tweet.tweet_results.result);
+        if (replyTo) {
+          await withXTweet(replyTo, async (art) => {
+            const b = art.querySelector('[data-testid="reply"]');
+            if (!b) throw new Error('X\'s Reply button isn\'t there');
+            b.click();
+            await xSend(text);
+          });
+        } else if (quote) {
+          await withXTweet(quote, async (art) => {
+            const b = art.querySelector('[data-testid="retweet"], [data-testid="unretweet"]');
+            if (!b) throw new Error('X\'s Retweet button isn\'t there');
+            b.click();
+            const q = await waitUntil(() => [...document.querySelectorAll('[role="menuitem"], a[href="/compose/post"]')].find((m) => /quote/i.test(m.textContent || '')), 4000);
+            if (!q) throw new Error('X\'s Quote option didn\'t show');
+            q.click();
+            await xSend(text);
+          });
+        } else {
+          await silently('/compose/post', () => xSend(text));
+        }
         closeModal();
         toast('Your Tweet was sent.');
-        const stream = main.querySelector('.center .stream, .conv .stream');
-        if (t && stream) stream.insertAdjacentHTML('afterbegin', tweetHtml({ kind: 'tweet', tweet: t }));
       } catch (e) {
         send.disabled = false;
         send.textContent = replyTo ? 'Reply' : 'Tweet';
         toast(`Couldn't send: ${e.message}`);
       }
+      setTimeout(() => { if (state.active) root.focus && root.focus(); }, 0);
     });
   }
   function closeModal() {
@@ -865,14 +1045,14 @@
         const art = act.closest('article[data-id]');
         const t = art ? state.cache.get(art.dataset.id) : (act.dataset.id ? state.cache.get(act.dataset.id) : null);
         switch (act.dataset.act) {
-          case 'like': if (t) toggleLike(act, t); break;
+          case 'like': if (t) toggleLike(t); break;
           case 'retweet': if (t) retweetMenu(act, t); break;
           case 'reply': if (t) openComposer({ replyTo: t }); break;
           case 'compose': openComposer(); break;
           case 'copy': if (t) { navigator.clipboard.writeText(`https://x.com/${t.user ? t.user.screen : 'i'}/status/${t.id}`).then(() => toast('Link copied')); } break;
           case 'follow': follow(act); break;
           case 'close': closeModal(); break;
-          case 'retry': route(); break;
+          case 'retry': lastPath = null; location.reload(); break;
           case 'new-ui': setActive(false); location.reload(); break;
           default: break;
         }
@@ -903,16 +1083,14 @@
     });
     shadow.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeModal(); root.querySelector('.menu').hidden = true; } });
     pollBadges();
-    setInterval(pollBadges, 60000);
+    setInterval(pollBadges, 5000);
   }
-  async function pollBadges() {
-    if (!state.active) return;
-    try {
-      const b = await rest('2/badge_count/badge_count.json?supports_ntab_urt=1');
-      const set = (sel, n) => { const el = root.querySelector(sel); if (!el) return; el.hidden = !n; el.textContent = n > 9 ? '9+' : String(n || ''); };
-      set('[data-nav="notifications"] .badge', b.ntab_unread_count);
-      set('[data-nav="messages"] .badge', b.dm_unread_count);
-    } catch { /* ignore */ }
+  function pollBadges() {
+    if (!state.active || !root) return;
+    viewer(); // also fills in your picture once X shows it
+    const m = /^\((\d+)\+?\)/.exec(document.title);
+    const el = root.querySelector('[data-nav="notifications"] .badge');
+    if (el) { const n = m ? Number(m[1]) : 0; el.hidden = !n; el.textContent = n > 9 ? '9+' : String(n || ''); }
   }
 
   // ==================================================================== styles
@@ -1100,11 +1278,18 @@
   `;
 
   // ==================================================================== start
-  const hideX = document.createElement('style');
-  hideX.textContent = 'html.ranch-classic-on, html.ranch-classic-on body { overflow: hidden !important; } html.ranch-classic-on #react-root { visibility: hidden !important; }';
-  (document.head || document.documentElement).appendChild(hideX);
-  // Cover X's page right away on pages we draw, so it doesn't flash first
-  if (signedIn() && routeOf(location.pathname)) document.documentElement.classList.add('ranch-classic-on');
-  const start = () => route();
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+  // This script starts before the page exists; wait for its <html> element
+  function boot() {
+    const hideX = document.createElement('style');
+    hideX.textContent = 'html.ranch-classic-on, html.ranch-classic-on body { overflow: hidden !important; } html.ranch-classic-on #react-root { opacity: 0 !important; pointer-events: none !important; }';
+    (document.head || document.documentElement).appendChild(hideX);
+    // Cover X's page right away on pages we draw, so it doesn't flash first
+    if (signedIn() && routeOf(location.pathname)) document.documentElement.classList.add('ranch-classic-on');
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => route()); else route();
+  }
+  if (document.documentElement) boot();
+  else {
+    const waitForPage = new MutationObserver(() => { if (document.documentElement) { waitForPage.disconnect(); boot(); } });
+    waitForPage.observe(document, { childList: true });
+  }
 })();
