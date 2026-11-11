@@ -639,7 +639,7 @@
   function dashHtml(me) {
     const stat = (n) => (n != null ? compact(n) || 0 : '–');
     return `<aside class="side">
-        <div class="card dash" data-screen="${esc(me.screen)}">
+        <div class="card dash" data-screen="${esc(me.screen)}" data-tweets="${me.tweets != null ? me.tweets : ''}">
           <a href="/${esc(me.screen)}" data-route class="dash-banner" style="${me.banner ? `background-image:url('${esc(me.banner)}/600x200')` : ''}"></a>
           <div class="dash-body">
             <a href="/${esc(me.screen)}" data-route>${avatar(me, 72, 'dash-av')}</a>
@@ -663,27 +663,34 @@
       </section>
       <aside class="side right">${footerHtml()}</aside>
     </div>`;
-    // X fills in its account button a moment after the page starts: redraw the card then
-    if (!me.screen || me.tweets == null) {
-      const started = Date.now();
-      const t = setInterval(() => {
-        const now = viewer();
-        const card = main.querySelector('.dash');
-        if (!card || Date.now() - started > 30000) { clearInterval(t); return; }
-        if (now.screen && (card.dataset.screen !== now.screen || (now.tweets != null && me.tweets == null))) {
-          clearInterval(t);
-          if (state.active && routeOf(location.pathname) && routeOf(location.pathname).page === 'home') {
-            const old = main.querySelector('.side:not(.right)');
-            const tmp = document.createElement('div');
-            tmp.innerHTML = dashHtml(now);
-            if (old) old.replaceWith(tmp.firstElementChild);
-          }
-        }
-      }, 700);
-      state.cleanup.push(() => clearInterval(t));
-    }
+    // Keep the card up to date: X shows who you are a moment after starting, and your
+    // counts come from your profile (loaded once in the background, below)
+    const started = Date.now();
+    const refreshDash = () => {
+      const now = viewer();
+      const card = main.querySelector('.dash');
+      if (!card || !now.screen) return;
+      const r = routeOf(location.pathname);
+      if (!state.active || !r || r.page !== 'home') return;
+      if (card.dataset.screen === now.screen && card.dataset.tweets === String(now.tweets != null ? now.tweets : '')) return;
+      const tmp = document.createElement('div');
+      tmp.innerHTML = dashHtml(now);
+      card.closest('.side').replaceWith(tmp.firstElementChild);
+    };
+    const dashTimer = setInterval(() => { refreshDash(); if (Date.now() - started > 60000) clearInterval(dashTimer); }, 700);
+    state.cleanup.push(() => clearInterval(dashTimer));
+    // X's Home never loads your own profile, so open it in X's hidden page once to get your counts
+    let countsTried = false;
+    const fetchCounts = async () => {
+      const now = viewer();
+      if (countsTried || !now.screen || now.tweets != null || state.silent) return;
+      countsTried = true;
+      try { await silently(`/${now.screen}`, () => waitUntil(() => viewer().tweets != null, 9000)); } catch { /* the card keeps its dashes */ }
+      refreshDash();
+    };
     let latest = false;
     liveStream(main.querySelector('.stream'), {
+      onFirst: () => setTimeout(fetchCounts, 1500),
       ops: ['HomeLatestTimeline', 'HomeTimeline'],
       read: (msg, s) => {
         // Prefer the Following (latest) timeline; drop "For you" once Following arrives
@@ -1280,6 +1287,11 @@
   // ==================================================================== start
   // This script starts before the page exists; wait for its <html> element
   function boot() {
+    feed.listeners.add((msg) => {
+      if (msg.op !== 'UserByScreenName') return;
+      const u = normUser(msg.json && msg.json.data && msg.json.data.user);
+      if (u) rememberMe(u);
+    });
     const hideX = document.createElement('style');
     hideX.textContent = 'html.ranch-classic-on, html.ranch-classic-on body { overflow: hidden !important; } html.ranch-classic-on #react-root { opacity: 0 !important; pointer-events: none !important; }';
     (document.head || document.documentElement).appendChild(hideX);
