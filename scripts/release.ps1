@@ -36,15 +36,31 @@ Write-Host "Releasing $name v$version" -ForegroundColor Green
 if (Test-Path dist) { Remove-Item -Recurse -Force dist }
 Run npx @('electron-builder', '--win', '--publish', 'never')
 
+# The iPhone and Android apps' page script is made from src/preload.js
+Run node @('scripts/make-ios-script.js')
+
+# ---------------------------------------------------------------- Android
+# If ~\.gradle isn't writable here, use a Gradle folder inside the project and pass the signing settings along.
+$gradleHome = Join-Path $env:USERPROFILE '.gradle'
+$canWrite = $true
+try { $probe = Join-Path $gradleHome '.ranch-write-test'; [IO.File]::WriteAllText($probe, 'x'); Remove-Item $probe -Force } catch { $canWrite = $false }
+if (-not $canWrite) {
+  if (-not $env:GRADLE_USER_HOME) { $env:GRADLE_USER_HOME = Join-Path (Get-Location) 'android\.gradle-home' }
+  Get-Content (Join-Path $gradleHome 'gradle.properties') -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match '^(YTM_[A-Z_]+)=(.*)$' } |
+    ForEach-Object { Set-Item -Path "env:ORG_GRADLE_PROJECT_$($Matches[1])" -Value $Matches[2] }
+}
+Push-Location android
+try { Run '.\gradlew.bat' @('assembleRelease', '--no-daemon', '-q') } finally { Pop-Location }
+Copy-Item "android\app\build\outputs\apk\release\$name-Android-$version.apk" 'dist\' -Force
+
 $assets = @(
   "dist\$name-Setup-$version.exe",
   "dist\$name-Setup-$version.exe.blockmap",
-  'dist\latest.yml'
+  'dist\latest.yml',
+  "dist\$name-Android-$version.apk"
 )
 foreach ($a in $assets) { if (-not (Test-Path $a)) { throw "Missing build output: $a" } }
-
-# The iPhone app's page script is made from src/preload.js
-Run node @('scripts/make-ios-script.js')
 
 # Commit and push the source for this version (the iPhone build uses it).
 Run git @('add', '-A')
@@ -55,6 +71,7 @@ Run git @('push', 'origin', 'HEAD')
 if (-not $Notes) {
   $Notes = "## Download`n" +
     "- **$name-Setup-$version.exe**: Windows installer. Updates itself with the green Update button.`n" +
+    "- **$name-Android-$version.apk**: Android app. Open it on your phone to install; its green Update button gets future versions.`n" +
     "- **$name-iOS-$version.ipa**: iPhone and iPad app (appears a few minutes after this release). Install it with [AltStore](https://altstore.io) or [Sideloadly](https://sideloadly.io) using your Apple ID.`n`n" +
     "Or install and update it from the [Ranch Launcher](https://github.com/KingCreeper531/ranch-launcher/releases/latest).`n`n" +
     "Windows may show a SmartScreen warning because the app isn't code-signed. Click **More info**, then **Run anyway**.`n"

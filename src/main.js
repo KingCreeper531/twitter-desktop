@@ -69,7 +69,11 @@ async function setupNetworkBlocking(ses) {
       read: fs.promises.readFile,
       write: fs.promises.writeFile,
     });
-    if (config.get('networkBlocking')) blocker.enableBlockingInSession(ses);
+    // Only block requests: the library's own page scripts can clash with the site's scripts
+    ses.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
+      if (!config.get('networkBlocking') || details.resourceType === 'mainFrame') return callback({});
+      try { blocker.onBeforeRequest(details, callback); } catch { callback({}); }
+    });
     log('Tracker blocking ready');
   } catch (e) {
     log(`Tracker blocking unavailable: ${e.message}`);
@@ -257,11 +261,7 @@ ipcMain.handle('tb:clear-data', async () => {
 });
 
 config.onChange((cfg, before) => {
-  if (cfg.networkBlocking !== before.networkBlocking && blocker) {
-    const ses = session.fromPartition(site.partition);
-    if (cfg.networkBlocking && !blocker.isBlockingEnabled(ses)) blocker.enableBlockingInSession(ses);
-    if (!cfg.networkBlocking && blocker.isBlockingEnabled(ses)) blocker.disableBlockingInSession(ses);
-  }
+  // (networkBlocking is read on every request, so turning it on or off needs nothing here)
   if (cfg.unreadBadge !== before.unreadBadge) setUnread(unread);
   if (PAGE_KEYS.some((k) => JSON.stringify(cfg[k]) !== JSON.stringify(before[k]))) win?.webContents.send('rw:config', pageConfig(cfg));
 });

@@ -123,6 +123,12 @@
       if (why) { if (hide(cell, why)) counts[why] = (counts[why] || 0) + 1; }
       else if (cell.dataset.ranchHidden) { delete cell.dataset.ranchHidden; cell.style.removeProperty('display'); }
     }
+    // "Get the app" upsell on the phone sign-in page (you're already in the app)
+    if (cfg.hidePremium) {
+      for (const el of document.querySelectorAll('a, button, [role="button"]')) {
+        if (!el.dataset.ranchHidden && (el.textContent || '').trim() === 'Get the app') hide(el, 'get-the-app');
+      }
+    }
     // Promoted trends ("Promoted by …") and promoted accounts in suggestions
     if (cfg.hidePromoted) {
       for (const el of document.querySelectorAll('[data-testid="trend"], [data-testid="UserCell"]')) {

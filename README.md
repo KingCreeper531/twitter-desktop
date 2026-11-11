@@ -1,6 +1,6 @@
 # Twitter Desktop
 
-An unofficial Twitter (x.com) app for Windows and iPhone, part of the Ranch apps. Install and update it yourself, or through the [Ranch Launcher](https://github.com/KingCreeper531/ranch-launcher).
+An unofficial Twitter (x.com) app for Windows, Android and iPhone, part of the Ranch apps. Install and update it yourself, or through the [Ranch Launcher](https://github.com/KingCreeper531/ranch-launcher).
 
 ## Features
 
@@ -18,6 +18,7 @@ An unofficial Twitter (x.com) app for Windows and iPhone, part of the Ranch apps
 Get the latest release from the [Releases page](https://github.com/KingCreeper531/twitter-desktop/releases/latest):
 
 - `Twitter-Setup-x.y.z.exe`: Windows installer. It updates itself. Windows SmartScreen may warn because the app isn't code-signed: click **More info**, then **Run anyway**.
+- `Twitter-Android-x.y.z.apk`: Android app (Android 8 or newer) with the same ad blocking and cleanup. Open it on your phone to install; it updates itself.
 - `Twitter-iOS-x.y.z.ipa`: iPhone and iPad app with the same ad blocking, cleanup and classic look. It's unsigned, so install it with [AltStore](https://altstore.io) or [Sideloadly](https://sideloadly.io) using your Apple ID (a free one works).
 
 ## Build it yourself
