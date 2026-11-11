@@ -6,6 +6,24 @@ const { ipcRenderer, contextBridge, webFrame } = require('electron');
 let cfg = ipcRenderer.sendSync('rw:get-config');
 const log = (m) => ipcRenderer.send('rw:log', m);
 
+// ------------------------------------------------------------ classic 2018 layout (Windows)
+// Our own pages, drawn on top of x.com (src/classic/classic.js). The phone apps don't have
+// webFrame.executeJavaScript, so they skip this and keep the restyled new pages.
+if (cfg.classicLayout && webFrame.executeJavaScript && contextBridge.exposeInMainWorld) {
+  try {
+    contextBridge.exposeInMainWorld('ranchTwitter', {
+      getText: (url) => ipcRenderer.invoke('tw:get-text', String(url)),
+      openSettings: () => ipcRenderer.send('rw:open-settings'),
+      openOutside: (url) => ipcRenderer.send('rw:open-outside', String(url)),
+      setClassic: (on) => ipcRenderer.invoke('tb:settings-set', { classicLayout: !!on }),
+    });
+    const source = ipcRenderer.sendSync('tw:classic-source');
+    if (source) webFrame.executeJavaScript(source).catch((e) => log(`Classic layout error: ${e && e.message}`));
+  } catch (e) {
+    log(`Classic layout failed to start: ${e.message}`);
+  }
+}
+
 // ------------------------------------------------------------ page world: clean copied links
 contextBridge.executeInMainWorld({
   func: () => {
@@ -253,14 +271,112 @@ function classicLanding(on) {
   }
 }
 
+// The sign-in screens, restyled like Twitter's 2019 login page: white page, blue bird,
+// "Log in to Twitter", grey underlined fields and blue rounded buttons. It's still X's own
+// sign-in form underneath (that's what actually signs you in), just dressed differently.
+const LOGIN_PATHS = /^\/(i\/flow\/(login|signup|password_reset)|i\/jf\/onboarding|login|signup)/;
+const OLD_LOGIN_CSS = `
+  html.ranch-old-login, html.ranch-old-login body { background: #fff !important; color-scheme: light; }
+  html.ranch-old-login [data-ranch-login-bg] { background: #fff !important; box-shadow: none !important; border-color: transparent !important; }
+  html.ranch-old-login [data-ranch-login-card] { background: #fff !important; box-shadow: none !important; border: 0 !important; }
+  html.ranch-old-login [data-ranch-login-card] :is(p, span, label, h1, h2, div):not([data-ranch-login-primary] *):not([data-ranch-login-provider] *) { color: #14171a; }
+  html.ranch-old-login [data-ranch-login-card] a { color: #1da1f2 !important; }
+  html.ranch-old-login [data-ranch-login-title] { font: 700 23px/28px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif !important; color: #14171a !important; }
+  html.ranch-old-login [data-ranch-login-field] { background: #f5f8fa !important; border: 0 !important; border-bottom: 2px solid #657786 !important; border-radius: 2px 2px 0 0 !important; }
+  html.ranch-old-login [data-ranch-login-field]:focus-within { border-bottom-color: #1da1f2 !important; }
+  html.ranch-old-login [data-ranch-login-field] :is(input, label, span, div) { color: #14171a !important; background: transparent !important; }
+  html.ranch-old-login [data-ranch-login-field] label :is(span, div) { color: #657786 !important; }
+  html.ranch-old-login input { color: #14171a !important; caret-color: #1da1f2; }
+  html.ranch-old-login [data-ranch-login-primary] { background: #1da1f2 !important; border-color: #1da1f2 !important; border-radius: 9999px !important; }
+  html.ranch-old-login [data-ranch-login-primary] :is(p, span, div) { color: #fff !important; font-weight: 700 !important; }
+  html.ranch-old-login [data-ranch-login-primary]:disabled, html.ranch-old-login [data-ranch-login-primary][aria-disabled="true"] { opacity: .5 !important; }
+  html.ranch-old-login [data-ranch-login-provider] { background: #fff !important; border: 1px solid #1da1f2 !important; border-radius: 9999px !important; }
+  html.ranch-old-login [data-ranch-login-provider] :is(p, span, div) { color: #1da1f2 !important; font-weight: 700 !important; }
+  html.ranch-old-login [data-ranch-login-hide] { display: none !important; }
+  html.ranch-old-login div[role="presentation"][data-base-ui-inert] { background: #fff !important; }
+  html.ranch-old-login svg[data-ranch-logo] { color: #1da1f2 !important; fill: #1da1f2 !important; width: 39px !important; height: 39px !important; }
+`;
+const LOGIN_WORDS = new Map([
+  ["See what's happening", 'Log in to Twitter'], ['See what’s happening', 'Log in to Twitter'],
+  ['Sign in to X', 'Log in to Twitter'], ['Log in to X', 'Log in to Twitter'], ['Join X today', 'Join Twitter today'],
+  ['Email or username', 'Phone, email, or username'], ['Phone, email, or username', 'Phone, email, or username'],
+  ['Continue', 'Next'], ['Don’t have an account?', "Don't have an account?"], ['Sign up', 'Sign up for Twitter'],
+]);
+let oldLoginCss = null;
+const hasBg = (el) => { const c = getComputedStyle(el).backgroundColor; return c && c !== 'transparent' && !/rgba\(\d+, \d+, \d+, 0\)/.test(c); };
+function classicLogin(on) {
+  const active = on && LOGIN_PATHS.test(location.pathname);
+  const html = document.documentElement;
+  html.classList.toggle('ranch-old-login', active);
+  // Old Twitter's login page was white: use the sign-in screen's own light theme while it shows
+  if (active && html.dataset.theme && html.dataset.theme !== 'light') { html.dataset.ranchTheme = html.dataset.theme; html.dataset.theme = 'light'; }
+  if (!active && html.dataset.ranchTheme) { html.dataset.theme = html.dataset.ranchTheme; delete html.dataset.ranchTheme; }
+  if (!active) return;
+  if (!oldLoginCss) oldLoginCss = webFrame.insertCSS(OLD_LOGIN_CSS);
+  const form = document.querySelector('form') || document.querySelector('[role="dialog"]');
+  if (!form) return;
+  // The card and the dark layers behind it become the white page
+  let card = form;
+  while (card && card !== document.body && !hasBg(card)) card = card.parentElement;
+  if (card && card !== document.body) {
+    card.setAttribute('data-ranch-login-card', '');
+    for (let el = card.parentElement; el && el !== document.documentElement; el = el.parentElement) if (hasBg(el)) el.setAttribute('data-ranch-login-bg', '');
+  }
+  const scope = card && card !== document.body ? card : form;
+  // Blue bird instead of the X
+  const logo = [...scope.querySelectorAll('svg')].find((s) => { const w = s.getBoundingClientRect().width; return w >= 28 && w <= 64 && !s.closest('button, [role="button"], input'); });
+  if (logo && !logo.dataset.ranchLogo) {
+    logo.dataset.ranchLogo = JSON.stringify({ html: logo.innerHTML, viewBox: logo.getAttribute('viewBox') });
+    logo.setAttribute('viewBox', '0 0 24 24');
+    logo.innerHTML = `<path d="${BIRD}"></path>`;
+  }
+  // Words
+  for (const el of scope.querySelectorAll('p, span, h1, h2, label, div')) {
+    if (el.children.length) continue;
+    const t = (el.textContent || '').trim();
+    if (/^Select an option below/i.test(t)) { el.setAttribute('data-ranch-login-hide', ''); continue; }
+    const next = LOGIN_WORDS.get(t);
+    if (next && next !== t) { if (el.dataset.ranchOrig === undefined) el.dataset.ranchOrig = el.textContent; el.textContent = next; }
+    if (next === 'Log in to Twitter' || next === 'Join Twitter today' || (el.tagName === 'P' && el === scope.querySelector('p') && el.getBoundingClientRect().height > 24)) el.setAttribute('data-ranch-login-title', '');
+  }
+  // Fields: grey box with an underline
+  for (const input of scope.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"])')) {
+    let box = input;
+    for (let i = 0; i < 4 && box.parentElement; i++) {
+      box = box.parentElement;
+      const cs = getComputedStyle(box);
+      if (parseFloat(cs.borderTopWidth) > 0 || hasBg(box)) { box.setAttribute('data-ranch-login-field', ''); break; }
+    }
+  }
+  // Buttons: blue main button, white-and-blue sign-in options
+  for (const b of scope.querySelectorAll('button, [role="button"]')) {
+    const t = (b.textContent || '').trim();
+    if (/^Continue with /.test(t)) b.setAttribute('data-ranch-login-provider', '');
+    else if (/^(Next|Continue|Log in|Sign in|Sign up|Create account|Verify|Done)$/i.test(t) || b.type === 'submit') b.setAttribute('data-ranch-login-primary', '');
+  }
+  // Some of its buttons are plain boxes: find them by their label and colour the box
+  for (const el of scope.querySelectorAll('p, span, div')) {
+    const t = (el.textContent || '').trim();
+    const provider = /^Continue with /.test(t);
+    if (el.children.length || !(provider || /^(Next|Log in|Sign up for Twitter|Create account|Verify|Done)$/.test(t))) continue;
+    let box = el;
+    for (let i = 0; i < 5 && box.parentElement && !hasBg(box); i++) box = box.parentElement;
+    if (!hasBg(box) || box.getBoundingClientRect().height > 64) continue;
+    box.removeAttribute(provider ? 'data-ranch-login-primary' : 'data-ranch-login-provider');
+    box.setAttribute(provider ? 'data-ranch-login-provider' : 'data-ranch-login-primary', '');
+  }
+}
+
 function classicPass() {
   if (!cfg.classicTwitter) return;
   classicLogo(true);
   classicLanding(true);
+  classicLogin(true);
   classicText();
   if (document.title.includes(' / X')) document.title = document.title.replace(/ \/ X$/, ' / Twitter');
 }
 function classicUndo() {
+  classicLogin(false);
   classicLanding(false);
   classicLogo(false);
   for (const el of document.querySelectorAll('[data-ranch-orig]')) {
@@ -375,6 +491,8 @@ ipcRenderer.invoke('tb:update-get').then((s) => { updateState = s; renderButtons
 setInterval(renderButtons, 1000);
 
 ipcRenderer.on('rw:config', (_e, next) => {
+  // Switching the classic layout on or off needs a fresh page
+  if (!!next.classicLayout !== !!cfg.classicLayout && webFrame.executeJavaScript) { location.reload(); return; }
   cfg = next;
   applyCss();
   unhideAll();

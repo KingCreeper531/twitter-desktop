@@ -243,6 +243,7 @@ const PAGE_KEYS = site.settings.filter((s) => s.key).map((s) => s.key);
 const pageConfig = (cfg = config.load()) => Object.fromEntries(PAGE_KEYS.map((k) => [k, cfg[k]]));
 
 ipcMain.on('rw:get-config', (e) => { e.returnValue = pageConfig(); });
+if (site.setup) site.setup({ ipcMain, net, app, config, log });
 ipcMain.on('rw:open-settings', () => openSettings());
 ipcMain.on('rw:open-outside', (_e, url) => openOutside(String(url || '')));
 ipcMain.on('rw:log', (_e, m) => log(String(m).slice(0, 300)));
