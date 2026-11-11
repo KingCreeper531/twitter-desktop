@@ -411,6 +411,20 @@
     .text-secondary { color: #657786 !important; }
     input, textarea, [contenteditable="true"] { color: #14171a !important; caret-color: #1da1f2; }
     * { border-color: #e6ecf0; }
+    :host, [data-theme], .dark, .light {
+      --x-btn-tertiary: #e8f5fd !important; --x-btn-tertiary-hover: #d2ebfc !important; --x-btn-tertiary-pressed: #bde3fb !important;
+      --x-btn-tertiary-opaque: #e8f5fd !important; --x-btn-tertiary-opaque-hover: #d2ebfc !important; --x-btn-tertiary-opaque-pressed: #bde3fb !important;
+      --chat-creator-bubble: 203 89% 53% !important; /* your messages: Twitter blue */
+      --radius-chat-bubble: 20px !important;
+    }
+    /* 2018 bubbles: yours blue with white text, theirs light grey */
+    .rounded-chat-bubble { background-color: #e6ecf0 !important; color: #14171a !important; }
+    .rounded-chat-bubble.bg-chat-creator-bubble, .bg-chat-creator-bubble { background-color: #1da1f2 !important; color: #fff !important; }
+    .bg-chat-creator-bubble *, .bg-chat-creator-bubble a { color: #fff !important; }
+    .rounded-chat-bubble:not(.bg-chat-creator-bubble) a { color: #1da1f2 !important; }
+    .bg-gray-0 { background-color: #e6ecf0 !important; }
+    .bg-gray-300 { background-color: #ccd6dd !important; }
+    .bg-btn-tertiary { background-color: #e8f5fd !important; color: #1da1f2 !important; }
   `;
   let chatSheet = null;
   function chatSkin(on) {
