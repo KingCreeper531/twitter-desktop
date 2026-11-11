@@ -154,8 +154,10 @@ function createWindow() {
   const stays = (url) => isInternal(url) && !site.isRedirect?.(url);
   // "Continue with Google / Apple" sign-in opens in a small window inside the app (it reports back to the page)
   const SIGN_IN = /^https:\/\/(accounts\.google\.com|appleid\.apple\.com)\//;
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (SIGN_IN.test(url)) {
+  win.webContents.setWindowOpenHandler(({ url, referrer }) => {
+    // Google's and Apple's buttons open a blank popup first and fill it in afterwards
+    const fromSignIn = url === 'about:blank' && SIGN_IN.test((referrer && referrer.url) || '');
+    if (SIGN_IN.test(url) || fromSignIn) {
       return {
         action: 'allow',
         overrideBrowserWindowOptions: {
