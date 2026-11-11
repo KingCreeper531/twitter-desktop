@@ -93,6 +93,10 @@
     #ranch-settings-btn { width: 48px; padding: 0; margin: 4px 0 4px 2px; background: transparent; color: rgb(231, 233, 234); }
     #ranch-settings-btn:hover { background: rgba(231, 233, 234, .1); }
     #ranch-settings-btn.floating { position: fixed; left: 16px; bottom: 16px; z-index: 9999; background: #16181c; }
+    #ranch-settings-btn.on-light { color: #1da1f2; }
+    #ranch-settings-btn.on-light:hover { background: #e8f5fd; }
+    #ranch-settings-btn.floating.on-light { background: #fff; border: 1px solid #e6ecf0; box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+    #ranch-settings-btn.floating.on-light:hover { background: #e8f5fd; }
     #ranch-update-btn { padding: 0 16px; margin: 4px 0; background: #1ed760; color: #04210f; }
     #ranch-update-btn:hover:not(:disabled) { background: #1bc456; }
     @media (prefers-color-scheme: light) { #ranch-settings-btn { color: rgb(15, 20, 25); } }
@@ -475,6 +479,21 @@
     if (s.status === 'error' && s.version) return { text: 'Retry update', busy: false };
     return null;
   }
+  // Is the page right behind the button light? Looks at what's drawn under its middle.
+  function pageIsLight(btn) {
+    const r = btn.getBoundingClientRect();
+    if (!r.width) return document.documentElement.classList.contains('ranch-old-login');
+    const prev = btn.style.pointerEvents;
+    btn.style.pointerEvents = 'none';
+    let el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    btn.style.pointerEvents = prev;
+    for (; el && el !== document.documentElement; el = el.parentElement) {
+      const m = getComputedStyle(el).backgroundColor.match(/rgba?\(([\d.]+), ([\d.]+), ([\d.]+)(?:, ([\d.]+))?\)/);
+      if (m && (m[4] === undefined || Number(m[4]) > 0.5)) return (0.299 * m[1] + 0.587 * m[2] + 0.114 * m[3]) > 160;
+    }
+    const m = getComputedStyle(document.body || document.documentElement).backgroundColor.match(/(\d+), (\d+), (\d+)/);
+    return m ? (0.299 * m[1] + 0.587 * m[2] + 0.114 * m[3]) > 160 : false;
+  }
   function renderButtons() {
     if (!document.body) return;
     // At the bottom of the left menu, under Twitter's own links
@@ -497,6 +516,8 @@
       gear.classList.add('floating');
       if (gear.parentElement !== document.body) document.body.appendChild(gear);
     }
+    // Match the page behind it: light pages (like the old-style login) get a light button
+    gear.classList.toggle('on-light', pageIsLight(gear));
     const want = updateLabel(updateState);
     let upd = document.getElementById('ranch-update-btn');
     if (!want) { if (upd) upd.remove(); return; }
