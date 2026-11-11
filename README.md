@@ -5,7 +5,8 @@ An unofficial Twitter (x.com) app for Windows, Android and iPhone, part of the R
 ## Features
 
 - **No ads.** Hides promoted posts in your timeline, replies and search, promoted trends and promoted accounts, and blocks ad and tracker requests (EasyList and EasyPrivacy).
-- **Classic Twitter.** The blue bird logo and the old words: Tweet, Retweet, Tweets and "What's happening?". Only buttons, menus and labels change, never what people write. Turn it off in settings.
+- **Classic 2018 layout (Windows).** Twitter as it looked in 2018: the old top bar (Home, Notifications, Messages, the bird in the middle, Search and a blue Tweet button), Home with your profile card and your Following timeline, old-style profiles, single Tweets and notifications. X's own page runs hidden underneath and loads the data; like, retweet, reply, Tweet and follow press X's own buttons. Messages keep X's encrypted chat, in 2018 colours with blue and grey bubbles.
+- **Classic Twitter.** The blue bird logo and the old words (Tweet, Retweet, Tweets, "What's happening?") on X's pages, and the old "Log in to Twitter" sign-in page. Only buttons, menus and labels change, never what people write. Both can be turned off in settings.
 - **Opens on Following** instead of For you.
 - **Less clutter.** Hides Grok, Premium and verification upsells, and "Who to follow". Trends can be hidden too.
 - **Direct links.** Links open straight in your browser instead of going through t.co, and copied links lose their share-tracking codes.
