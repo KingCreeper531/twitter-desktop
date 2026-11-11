@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+/ios/build/
+/ios/*.xcodeproj/
+/ios/Payload/
+/ios/*.ipa
