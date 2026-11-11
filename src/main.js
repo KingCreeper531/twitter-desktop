@@ -72,6 +72,8 @@ async function setupNetworkBlocking(ses) {
     // Only block requests: the library's own page scripts can clash with the site's scripts
     ses.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
       if (!config.get('networkBlocking') || details.resourceType === 'mainFrame') return callback({});
+      // The site's own app requests (e.g. what Messages needs) are never blocked
+      if (site.neverBlock && site.neverBlock.test(details.url)) return callback({});
       try { blocker.onBeforeRequest(details, callback); } catch { callback({}); }
     });
     log('Tracker blocking ready');

@@ -332,6 +332,7 @@
     cache: new Map(), // tweet id -> tweet
     cleanup: [], // what to stop when leaving a page
     silent: false, // X's page is away doing something for us (a like, a reply…)
+    chat: false, // showing X's Messages under the classic top bar
   };
 
   // ==================================================================== the shell
@@ -385,7 +386,62 @@
   function setActive(on) {
     state.active = on;
     document.documentElement.classList.toggle('ranch-classic-on', on);
-    if (host) host.style.display = on ? '' : 'none';
+    if (host) host.style.display = on || state.chat ? '' : 'none';
+  }
+
+  // ==================================================================== Messages, 2018 style
+  // X's messages are encrypted and only X's own chat can read them, so this is X's real chat,
+  // recoloured with 2018 Twitter's palette, under the classic top bar.
+  const CHAT_PATH = /^\/(i\/chat|messages)(\/|$)/;
+  const CHAT_CSS = `
+    :host, [data-theme], .dark, .light {
+      --x-bg-primary: #fff !important; --x-bg-secondary: #f5f8fa !important; --x-bg-tertiary: #e6ecf0 !important;
+      --x-bg-quaternary: #f5f8fa !important; --x-bg-sheets: #fff !important; --x-bg-modal: #fff !important; --x-bg-inputs: #f5f8fa !important;
+      --x-fg-primary: #14171a !important; --x-fg-secondary: #657786 !important; --x-fg-on-color: #fff !important;
+      --x-border-normal: #e6ecf0 !important; --x-border-divider: #e6ecf0 !important; --x-border-hover: #ccd6dd !important;
+      --x-border-active: #1da1f2 !important; --x-border-media: #e6ecf0 !important;
+      --x-btn-primary: #1da1f2 !important; --x-btn-primary-hover: #1a91da !important; --x-btn-primary-pressed: #1681bf !important;
+      --x-btn-secondary: #e8f5fd !important; --x-btn-secondary-hover: #d2ebfc !important; --x-btn-secondary-pressed: #bde3fb !important;
+      color-scheme: light;
+    }
+    :host { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif !important; }
+    .font-chirp { font-family: inherit !important; }
+    .bg-primary { background-color: #fff !important; }
+    .text-primary { color: #14171a !important; }
+    .text-secondary { color: #657786 !important; }
+    input, textarea, [contenteditable="true"] { color: #14171a !important; caret-color: #1da1f2; }
+    * { border-color: #e6ecf0; }
+  `;
+  let chatSheet = null;
+  function chatSkin(on) {
+    for (const el of document.querySelectorAll('[data-testid="xchatEmbedRoute"], [data-testid="xchatEmbedDrawer"], [data-testid="chat-drawer-root"], [data-testid="xchatEmbedOverlays"]')) {
+      const sr = el.shadowRoot;
+      if (!sr) continue;
+      if (!chatSheet) { chatSheet = new CSSStyleSheet(); chatSheet.replaceSync(CHAT_CSS); }
+      const has = sr.adoptedStyleSheets.includes(chatSheet);
+      if (on && !has) sr.adoptedStyleSheets = [...sr.adoptedStyleSheets, chatSheet];
+      else if (!on && has) sr.adoptedStyleSheets = sr.adoptedStyleSheets.filter((s) => s !== chatSheet);
+    }
+  }
+  let chatTimer = null;
+  function setChat(on) {
+    state.chat = on;
+    document.documentElement.classList.toggle('ranch-classic-chat', on);
+    if (on) {
+      mountShell();
+      host.style.cssText = 'position:fixed;left:0;right:0;top:0;height:46px;z-index:2147483000;';
+      root.classList.add('bar-only');
+      for (const a of root.querySelectorAll('.nav')) a.classList.toggle('on', a.dataset.nav === 'messages');
+      viewer();
+      chatSkin(true);
+      if (!chatTimer) chatTimer = setInterval(() => chatSkin(true), 800); // the chat redraws itself
+    } else {
+      if (root) root.classList.remove('bar-only');
+      if (host) host.style.cssText = 'position:fixed;inset:0;z-index:2147483000;' + (state.active ? '' : 'display:none;');
+      clearInterval(chatTimer);
+      chatTimer = null;
+      chatSkin(false);
+    }
   }
   function toast(msg) {
     toastEl.textContent = msg;
@@ -412,6 +468,7 @@
     if (location.pathname === lastPath && state.active && r) return; // same page (e.g. X tidying its URL)
     lastPath = location.pathname;
     cleanup();
+    setChat(signedIn() && CHAT_PATH.test(location.pathname));
     if (!r) { setActive(false); return; }
     mountShell();
     setActive(true);
@@ -1108,6 +1165,8 @@
     position: fixed; inset: 0; overflow-y: auto; background: var(--bg); color: var(--text);
     font: 14px/1.3125 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; z-index: 1; }
   .app.night { --bg: #10171e; --card: #15202b; --line: #38444d; --text: #fff; --dim: #8899a6; --hover: #192734; }
+  .app.bar-only { bottom: auto; height: 46px; overflow: hidden; background: transparent; }
+  .app.bar-only > :not(.top):not(.menu) { display: none !important; }
   * { box-sizing: border-box; }
   a { color: var(--blue); text-decoration: none; }
   a:hover { text-decoration: underline; }
@@ -1293,7 +1352,7 @@
       if (u) rememberMe(u);
     });
     const hideX = document.createElement('style');
-    hideX.textContent = 'html.ranch-classic-on, html.ranch-classic-on body { overflow: hidden !important; } html.ranch-classic-on #react-root { opacity: 0 !important; pointer-events: none !important; }';
+    hideX.textContent = 'html.ranch-classic-on, html.ranch-classic-on body { overflow: hidden !important; } html.ranch-classic-on #react-root { opacity: 0 !important; pointer-events: none !important; } html.ranch-classic-chat #react-root { padding-top: 46px !important; box-sizing: border-box; } html.ranch-classic-chat header[role=banner] { display: none !important; } html.ranch-classic-chat body { background: #fff !important; } html.ranch-classic-chat #react-root *, html.ranch-classic-chat #react-root { border-color: #e6ecf0 !important; }';
     (document.head || document.documentElement).appendChild(hideX);
     // Cover X's page right away on pages we draw, so it doesn't flash first
     if (signedIn() && routeOf(location.pathname)) document.documentElement.classList.add('ranch-classic-on');

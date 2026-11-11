@@ -12,6 +12,9 @@ module.exports = {
 
   isRedirect: () => false,
 
+  /** X's own app requests; the tracker lists catch some of them (Messages breaks without them). */
+  neverBlock: /^https:\/\/(x|twitter)\.com\/i\/api\//,
+
   /** Removes share-tracking codes from x.com links. */
   cleanOutbound(url) {
     try {
